@@ -1,8 +1,9 @@
 """
-Hook logic for MemPalace — Python implementation of session-start, stop, and precompact hooks.
+Hook logic for MemPalace — Python implementation of session-start, stop, precompact, and
+user-prompt-submit hooks.
 
 Reads JSON from stdin, outputs JSON to stdout.
-Supported hooks: session-start, stop, precompact
+Supported hooks: session-start, stop, precompact, user-prompt-submit
 Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
 """
 
@@ -14,7 +15,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-SAVE_INTERVAL = 15
+from .config import MempalaceConfig
+
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
 
 STOP_BLOCK_REASON = (
@@ -203,11 +205,13 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
 
 
 def hook_stop(data: dict, harness: str):
-    """Stop hook: block every N messages for auto-save."""
+    """Stop hook: background-mine every N messages; block only if silent_save is False."""
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
     transcript_path = parsed["transcript_path"]
+
+    cfg = MempalaceConfig()
 
     # If already in a save cycle, let through (infinite-loop prevention)
     if str(stop_hook_active).lower() in ("true", "1", "yes"):
@@ -228,10 +232,11 @@ def hook_stop(data: dict, harness: str):
             last_save = 0
 
     since_last = exchange_count - last_save
+    save_interval = cfg.hook_save_interval
 
     _log(f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save")
 
-    if since_last >= SAVE_INTERVAL and exchange_count > 0:
+    if since_last >= save_interval and exchange_count > 0:
         # Update last save point
         try:
             last_save_file.write_text(str(exchange_count), encoding="utf-8")
@@ -240,10 +245,14 @@ def hook_stop(data: dict, harness: str):
 
         _log(f"TRIGGERING SAVE at exchange {exchange_count}")
 
-        # Optional: auto-ingest if MEMPAL_DIR is set
+        # Mine transcript in background (Popen — non-blocking)
         _maybe_auto_ingest(transcript_path)
 
-        _output({"decision": "block", "reason": STOP_BLOCK_REASON})
+        # Block the conversation only if silent_save is explicitly disabled
+        if cfg.hook_silent_save:
+            _output({})
+        else:
+            _output({"decision": "block", "reason": STOP_BLOCK_REASON})
     else:
         _output({})
 
@@ -259,6 +268,40 @@ def hook_session_start(data: dict, harness: str):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Pass through — no blocking on session start
+    _output({})
+
+
+def hook_user_prompt_submit(data: dict, harness: str):
+    """UserPromptSubmit hook: inject wake-up context on the first message of a session."""
+    parsed = _parse_harness_input(data, harness)
+    session_id = parsed["session_id"]
+    transcript_path = parsed["transcript_path"]
+
+    # Only inject on the first message (no prior human exchanges in this session)
+    exchange_count = _count_human_messages(transcript_path)
+    if exchange_count > 1:
+        _output({})
+        return
+
+    _log(f"SESSION WAKE-UP inject for session {session_id}")
+
+    try:
+        from .layers import MemoryStack
+
+        cfg = MempalaceConfig()
+        stack = MemoryStack(palace_path=cfg.palace_path)
+        wake_text = stack.wake_up()
+        if wake_text and wake_text.strip():
+            _output({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalSystemPrompt": wake_text,
+                }
+            })
+            return
+    except Exception as e:
+        _log(f"wake-up injection failed: {e}")
+
     _output({})
 
 
@@ -286,6 +329,7 @@ def run_hook(hook_name: str, harness: str):
 
     hooks = {
         "session-start": hook_session_start,
+        "user-prompt-submit": hook_user_prompt_submit,
         "stop": hook_stop,
         "precompact": hook_precompact,
     }

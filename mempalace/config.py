@@ -203,6 +203,11 @@ class MempalaceConfig:
         return self._file_config.get("hooks", {}).get("silent_save", True)
 
     @property
+    def hook_save_interval(self):
+        """Number of human exchanges between auto-save triggers."""
+        return int(self._file_config.get("hooks", {}).get("save_interval", 50))
+
+    @property
     def hook_desktop_toast(self):
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
